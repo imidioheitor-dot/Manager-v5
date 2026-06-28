@@ -1,0 +1,934 @@
+mkdir -p meeting-guardian/{src,tests} && cd meeting-guardian && cat > src/__init__.py << 'EOF'
+# Meeting Guardian - Pacote principal
+EOF
+
+cat > tests/__init__.py << 'EOF'
+# Meeting Guardian - Pacote de testes
+EOF
+
+cat > src/models.py << 'PYEOF'
+from dataclasses import dataclass, field
+from datetime import datetime
+from enum import Enum
+from typing import Optional
+
+
+class EventCategory(str, Enum):
+    WORK = "Trabalho"
+    STUDY = "Estudos"
+    PERSONAL = "Pessoal"
+    HEALTH = "Saúde"
+    TRAVEL = "Viagem"
+    OTHER = "Outros"
+
+
+class WorkloadLevel(str, Enum):
+    LIGHT = "Leve"
+    MODERATE = "Moderada"
+    HEAVY = "Pesada"
+
+
+@dataclass
+class CalendarEvent:
+    id: str
+    title: str
+    start: datetime
+    end: datetime
+    description: Optional[str] = None
+    location: Optional[str] = None
+    meet_link: Optional[str] = None
+    attendees: list[str] = field(default_factory=list)
+    category: EventCategory = EventCategory.OTHER
+    is_recurring: bool = False
+
+    @property
+    def duration_minutes(self) -> int:
+        delta = self.end - self.start
+        return int(delta.total_seconds() / 60)
+
+    @property
+    def duration_hours(self) -> float:
+        return round(self.duration_minutes / 60, 2)
+
+
+@dataclass
+class DailySummary:
+    date: datetime
+    events: list[CalendarEvent]
+    free_blocks: list[tuple[datetime, datetime]]
+    total_meeting_hours: float
+    workload: WorkloadLevel
+    conflicts: list[tuple[CalendarEvent, CalendarEvent]]
+    user_name: str
+
+    @property
+    def event_count(self) -> int:
+        return len(self.events)
+PYEOF
+
+cat > src/calendar_service.py << 'PYEOF'
+import logging
+import os
+from datetime import datetime, timedelta, timezone
+from typing import Optional
+
+from google.auth.transport.requests import Request
+from google.oauth2.credentials import Credentials
+from google_auth_oauthlib.flow import InstalledAppFlow
+from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
+
+from .models import CalendarEvent, EventCategory
+
+logger = logging.getLogger(__name__)
+
+SCOPES = ["https://www.googleapis.com/auth/calendar.readonly"]
+
+CATEGORY_KEYWORDS: dict[EventCategory, list[str]] = {
+    EventCategory.WORK: [
+        "reunião", "meeting", "projeto", "sprint", "review", "deploy",
+        "daily", "planning", "retrospectiva", "entrega", "apresentação",
+    ],
+    EventCategory.STUDY: [
+        "aula", "curso", "estudo", "faculdade", "cálculo", "prova",
+        "workshop", "treinamento", "mentoria", "palestra",
+    ],
+    EventCategory.HEALTH: [
+        "médico", "dentista", "consulta", "academia", "treino",
+        "psicólogo", "exame", "saúde",
+    ],
+    EventCategory.TRAVEL: [
+        "viagem", "voo", "aeroporto", "hotel", "check-in", "check-out",
+    ],
+    EventCategory.PERSONAL: [
+        "aniversário", "família", "amigos", "lazer", "pessoal",
+        "férias", "almoço", "jantar",
+    ],
+}
+
+
+class CalendarService:
+    def __init__(self) -> None:
+        self._credentials_path = os.getenv("GOOGLE_CREDENTIALS_PATH", "credentials.json")
+        self._token_path = os.getenv("GOOGLE_TOKEN_PATH", "token.json")
+        self._service = self._build_service()
+
+    def _build_service(self):
+        creds: Optional[Credentials] = None
+
+        if os.path.exists(self._token_path):
+            creds = Credentials.from_authorized_user_file(self._token_path, SCOPES)
+
+        if not creds or not creds.valid:
+            if creds and creds.expired and creds.refresh_token:
+                creds.refresh(Request())
+            else:
+                flow = InstalledAppFlow.from_client_secrets_file(
+                    self._credentials_path, SCOPES
+                )
+                creds = flow.run_local_server(port=0)
+
+            with open(self._token_path, "w") as token_file:
+                token_file.write(creds.to_json())
+
+        return build("calendar", "v3", credentials=creds)
+
+    def get_today_events(self) -> list[CalendarEvent]:
+        now = datetime.now(timezone.utc)
+        start_of_day = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        end_of_day = start_of_day + timedelta(days=1)
+        return self._fetch_events(start_of_day, end_of_day)
+
+    def get_upcoming_events(self, minutes_ahead: int = 35) -> list[CalendarEvent]:
+        now = datetime.now(timezone.utc)
+        future = now + timedelta(minutes=minutes_ahead)
+        return self._fetch_events(now, future)
+
+    def _fetch_events(self, time_min: datetime, time_max: datetime) -> list[CalendarEvent]:
+        try:
+            result = (
+                self._service.events()
+                .list(
+                    calendarId="primary",
+                    timeMin=time_min.isoformat(),
+                    timeMax=time_max.isoformat(),
+                    singleEvents=True,
+                    orderBy="startTime",
+                )
+                .execute()
+            )
+            raw_events = result.get("items", [])
+            logger.info("Fetched %d events from Google Calendar", len(raw_events))
+            return [self._parse_event(e) for e in raw_events]
+        except HttpError as exc:
+            logger.error("Google Calendar API error: %s", exc)
+            raise
+
+    def _parse_event(self, raw: dict) -> CalendarEvent:
+        start_str = raw["start"].get("dateTime") or raw["start"].get("date")
+        end_str = raw["end"].get("dateTime") or raw["end"].get("date")
+
+        start = datetime.fromisoformat(start_str)
+        end = datetime.fromisoformat(end_str)
+
+        if start.tzinfo is None:
+            start = start.replace(tzinfo=timezone.utc)
+        if end.tzinfo is None:
+            end = end.replace(tzinfo=timezone.utc)
+
+        attendees = [
+            a.get("email", "")
+            for a in raw.get("attendees", [])
+            if not a.get("self", False)
+        ]
+
+        meet_link: Optional[str] = None
+        for entry_point in raw.get("conferenceData", {}).get("entryPoints", []):
+            if entry_point.get("entryPointType") == "video":
+                meet_link = entry_point.get("uri")
+                break
+
+        title = raw.get("summary", "Sem título")
+        description = raw.get("description", "")
+        location = raw.get("location", "")
+        is_recurring = bool(raw.get("recurringEventId"))
+        category = self._classify_event(title, description)
+
+        return CalendarEvent(
+            id=raw["id"],
+            title=title,
+            start=start,
+            end=end,
+            description=description or None,
+            location=location or None,
+            meet_link=meet_link,
+            attendees=attendees,
+            category=category,
+            is_recurring=is_recurring,
+        )
+
+    @staticmethod
+    def _classify_event(title: str, description: str) -> EventCategory:
+        text = f"{title} {description}".lower()
+        for category, keywords in CATEGORY_KEYWORDS.items():
+            if any(kw in text for kw in keywords):
+                return category
+        return EventCategory.OTHER
+PYEOF
+
+cat > src/ai_summary_service.py << 'PYEOF'
+import logging
+import os
+from datetime import datetime, timezone
+
+from anthropic import Anthropic
+
+from .models import CalendarEvent, DailySummary, EventCategory, WorkloadLevel
+
+logger = logging.getLogger(__name__)
+
+
+class AISummaryService:
+    def __init__(self) -> None:
+        self._client = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+        self._model = os.getenv("CLAUDE_MODEL", "claude-3-5-sonnet-20241022")
+        self._user_name = os.getenv("USER_NAME", "Usuário")
+
+    def generate_daily_summary(self, events: list[CalendarEvent]) -> DailySummary:
+        now = datetime.now(timezone.utc)
+        free_blocks = self._compute_free_blocks(events)
+        total_hours = round(sum(e.duration_hours for e in events), 2)
+        workload = self._compute_workload(total_hours, len(events))
+        conflicts = self._detect_conflicts(events)
+
+        return DailySummary(
+            date=now,
+            events=events,
+            free_blocks=free_blocks,
+            total_meeting_hours=total_hours,
+            workload=workload,
+            conflicts=conflicts,
+            user_name=self._user_name,
+        )
+
+    def generate_daily_message(self, summary: DailySummary) -> str:
+        events_text = self._format_events_for_prompt(summary.events)
+        free_text = self._format_free_blocks(summary.free_blocks)
+        conflicts_text = (
+            "Nenhum conflito detectado."
+            if not summary.conflicts
+            else f"{len(summary.conflicts)} conflito(s) detectado(s)."
+        )
+
+        prompt = f"""
+Você é um assistente pessoal executivo. Gere um resumo diário profissional,
+caloroso e objetivo para {summary.user_name}.
+
+Data: {summary.date.strftime('%d/%m/%Y')}
+Total de eventos: {summary.event_count}
+Horas em reuniões: {summary.total_meeting_hours}h
+Carga de trabalho: {summary.workload.value}
+Conflitos: {conflicts_text}
+
+Eventos do dia:
+{events_text}
+
+Blocos livres:
+{free_text}
+
+Escreva uma mensagem de bom dia com:
+1. Saudação personalizada com o nome
+2. Lista formatada de todos os eventos com horários
+3. Pontos importantes (carga, blocos livres, conflitos)
+4. Uma frase motivacional ao final
+
+Use emojis com moderação. Seja conciso e direto.
+"""
+
+        response = self._client.messages.create(
+            model=self._model,
+            max_tokens=1024,
+            messages=[{"role": "user", "content": prompt}],
+        )
+
+        message = response.content[0].text
+        logger.info("Daily summary generated successfully")
+        return message
+
+    def generate_reminder_message(self, event: CalendarEvent) -> str:
+        attendees_str = (
+            ", ".join(event.attendees[:5]) if event.attendees else "Nenhum convidado"
+        )
+        prompt = f"""
+Gere um lembrete de reunião conciso e útil para {os.getenv('USER_NAME', 'o usuário')}.
+
+Evento: {event.title}
+Horário: {event.start.strftime('%H:%M')}
+Duração: {event.duration_minutes} minutos
+Categoria: {event.category.value}
+Descrição: {event.description or 'Sem descrição'}
+Local/Link: {event.meet_link or event.location or 'Não informado'}
+Participantes: {attendees_str}
+
+Escreva um lembrete contextual de 30 minutos antes, incluindo todas as
+informações relevantes. Seja direto e inclua o link se disponível.
+"""
+
+        response = self._client.messages.create(
+            model=self._model,
+            max_tokens=512,
+            messages=[{"role": "user", "content": prompt}],
+        )
+
+        return response.content[0].text
+
+    @staticmethod
+    def _format_events_for_prompt(events: list[CalendarEvent]) -> str:
+        lines = []
+        for event in events:
+            lines.append(
+                f"- {event.start.strftime('%H:%M')}–{event.end.strftime('%H:%M')}: "
+                f"{event.title} [{event.category.value}]"
+            )
+        return "\n".join(lines) if lines else "Nenhum evento hoje."
+
+    @staticmethod
+    def _format_free_blocks(blocks: list[tuple[datetime, datetime]]) -> str:
+        if not blocks:
+            return "Nenhum bloco livre significativo."
+        return "\n".join(
+            f"- {s.strftime('%H:%M')}–{e.strftime('%H:%M')}" for s, e in blocks
+        )
+
+    @staticmethod
+    def _compute_free_blocks(
+        events: list[CalendarEvent], min_block_minutes: int = 30
+    ) -> list[tuple[datetime, datetime]]:
+        if not events:
+            return []
+        sorted_events = sorted(events, key=lambda e: e.start)
+        blocks: list[tuple[datetime, datetime]] = []
+        prev_end = sorted_events[0].end
+        for event in sorted_events[1:]:
+            gap_minutes = (event.start - prev_end).total_seconds() / 60
+            if gap_minutes >= min_block_minutes:
+                blocks.append((prev_end, event.start))
+            prev_end = max(prev_end, event.end)
+        return blocks
+
+    @staticmethod
+    def _compute_workload(total_hours: float, event_count: int) -> WorkloadLevel:
+        if total_hours <= 2 and event_count <= 2:
+            return WorkloadLevel.LIGHT
+        if total_hours <= 5 and event_count <= 5:
+            return WorkloadLevel.MODERATE
+        return WorkloadLevel.HEAVY
+
+    @staticmethod
+    def _detect_conflicts(
+        events: list[CalendarEvent],
+    ) -> list[tuple[CalendarEvent, CalendarEvent]]:
+        conflicts: list[tuple[CalendarEvent, CalendarEvent]] = []
+        sorted_events = sorted(events, key=lambda e: e.start)
+        for i, event_a in enumerate(sorted_events):
+            for event_b in sorted_events[i + 1:]:
+                if event_b.start >= event_a.end:
+                    break
+                conflicts.append((event_a, event_b))
+        return conflicts
+PYEOF
+
+cat > src/slack_service.py << 'PYEOF'
+import logging
+import os
+
+from slack_sdk import WebClient
+from slack_sdk.errors import SlackApiError
+
+logger = logging.getLogger(__name__)
+
+
+class SlackService:
+    def __init__(self) -> None:
+        self._client = WebClient(token=os.getenv("SLACK_BOT_TOKEN"))
+        self._user_id = os.getenv("SLACK_USER_ID")
+
+        if not self._user_id:
+            raise ValueError("SLACK_USER_ID must be set in environment variables.")
+
+    def send_direct_message(self, message: str) -> None:
+        try:
+            response = self._client.chat_postMessage(
+                channel=self._user_id,
+                text=message,
+                mrkdwn=True,
+            )
+            logger.info("Slack DM sent successfully. ts=%s", response["ts"])
+        except SlackApiError as exc:
+            logger.error("Failed to send Slack DM. error=%s", exc.response["error"])
+            raise
+PYEOF
+
+cat > src/email_service.py << 'PYEOF'
+import logging
+import os
+import smtplib
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+
+logger = logging.getLogger(__name__)
+
+HTML_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Meeting Guardian</title>
+  <style>
+    body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+            background: #f4f6f9; margin: 0; padding: 20px; color: #333; }}
+    .container {{ max-width: 600px; margin: 0 auto; background: #fff;
+                  border-radius: 12px; overflow: hidden;
+                  box-shadow: 0 2px 12px rgba(0,0,0,.08); }}
+    .header {{ background: linear-gradient(135deg, #1a73e8, #0d47a1);
+               padding: 28px 32px; color: #fff; }}
+    .header h1 {{ margin: 0; font-size: 22px; font-weight: 600; }}
+    .header p  {{ margin: 4px 0 0; opacity: .85; font-size: 14px; }}
+    .body  {{ padding: 28px 32px; line-height: 1.7; white-space: pre-wrap; }}
+    .footer {{ background: #f4f6f9; padding: 16px 32px;
+               font-size: 12px; color: #888; text-align: center; }}
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="header">
+      <h1>🛡️ Meeting Guardian</h1>
+      <p>{subtitle}</p>
+    </div>
+    <div class="body">{body}</div>
+    <div class="footer">
+      Enviado automaticamente pelo Meeting Guardian &bull; {date}
+    </div>
+  </div>
+</body>
+</html>
+"""
+
+
+class EmailService:
+    def __init__(self) -> None:
+        self._smtp_host = os.getenv("SMTP_HOST", "smtp.gmail.com")
+        self._smtp_port = int(os.getenv("SMTP_PORT", "587"))
+        self._smtp_user = os.getenv("SMTP_USER")
+        self._smtp_password = os.getenv("SMTP_PASSWORD")
+        self._recipient = os.getenv("EMAIL_RECIPIENT")
+
+        if not all([self._smtp_user, self._smtp_password, self._recipient]):
+            raise ValueError("SMTP_USER, SMTP_PASSWORD and EMAIL_RECIPIENT must be set.")
+
+    def send(self, subject: str, plain_body: str, subtitle: str = "") -> None:
+        from datetime import datetime
+
+        html_body = HTML_TEMPLATE.format(
+            subtitle=subtitle or subject,
+            body=plain_body.replace("\n", "<br>"),
+            date=datetime.now().strftime("%d/%m/%Y %H:%M"),
+        )
+
+        msg = MIMEMultipart("alternative")
+        msg["Subject"] = subject
+        msg["From"] = self._smtp_user
+        msg["To"] = self._recipient
+        msg.attach(MIMEText(plain_body, "plain", "utf-8"))
+        msg.attach(MIMEText(html_body, "html", "utf-8"))
+
+        try:
+            with smtplib.SMTP(self._smtp_host, self._smtp_port) as server:
+                server.ehlo()
+                server.starttls()
+                server.login(self._smtp_user, self._smtp_password)
+                server.sendmail(self._smtp_user, self._recipient, msg.as_string())
+            logger.info("Email sent to %s", self._recipient)
+        except smtplib.SMTPException as exc:
+            logger.error("Failed to send email: %s", exc)
+            raise
+PYEOF
+
+cat > src/scheduler.py << 'PYEOF'
+import logging
+from datetime import datetime, timezone
+
+from apscheduler.schedulers.blocking import BlockingScheduler
+from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.interval import IntervalTrigger
+
+from .ai_summary_service import AISummaryService
+from .calendar_service import CalendarService
+from .email_service import EmailService
+from .slack_service import SlackService
+
+logger = logging.getLogger(__name__)
+
+
+class MeetingGuardianScheduler:
+    def __init__(self) -> None:
+        self._calendar = CalendarService()
+        self._ai = AISummaryService()
+        self._slack = SlackService()
+        self._email = EmailService()
+        self._scheduler = BlockingScheduler(timezone="America/Sao_Paulo")
+        self._reminded_events: set[str] = set()
+
+    def run_daily_summary(self) -> None:
+        logger.info("Running daily summary job")
+        try:
+            events = self._calendar.get_today_events()
+            summary = self._ai.generate_daily_summary(events)
+            message = self._ai.generate_daily_message(summary)
+            self._slack.send_direct_message(message)
+            self._email.send(
+                subject=f"📅 Agenda do dia — {summary.date.strftime('%d/%m/%Y')}",
+                plain_body=message,
+                subtitle=f"{summary.event_count} eventos • Carga {summary.workload.value}",
+            )
+            logger.info("Daily summary dispatched successfully")
+        except Exception as exc:
+            logger.error("Daily summary job failed: %s", exc, exc_info=True)
+
+    def run_reminder_check(self) -> None:
+        logger.info("Running reminder check")
+        try:
+            upcoming = self._calendar.get_upcoming_events(minutes_ahead=35)
+            now = datetime.now(timezone.utc)
+            for event in upcoming:
+                minutes_until = (event.start - now).total_seconds() / 60
+                if event.id in self._reminded_events:
+                    continue
+                if 25 <= minutes_until <= 35:
+                    self._send_reminder(event)
+                    self._reminded_events.add(event.id)
+        except Exception as exc:
+            logger.error("Reminder check failed: %s", exc, exc_info=True)
+
+    def _send_reminder(self, event) -> None:
+        logger.info("Sending reminder for event: %s", event.title)
+        message = self._ai.generate_reminder_message(event)
+        self._slack.send_direct_message(message)
+        self._email.send(
+            subject=f"⏰ Lembrete: {event.title} em 30 minutos",
+            plain_body=message,
+            subtitle=f"Começa às {event.start.strftime('%H:%M')}",
+        )
+
+    def start(self) -> None:
+        self._scheduler.add_job(
+            self.run_daily_summary,
+            CronTrigger(hour=6, minute=0),
+            id="daily_summary",
+            name="Daily Summary",
+            replace_existing=True,
+        )
+        self._scheduler.add_job(
+            self.run_reminder_check,
+            IntervalTrigger(minutes=5),
+            id="reminder_check",
+            name="Reminder Check",
+            replace_existing=True,
+        )
+        logger.info("Meeting Guardian scheduler started")
+        self._scheduler.start()
+PYEOF
+
+cat > src/main.py << 'PYEOF'
+import logging
+import os
+import sys
+
+from dotenv import load_dotenv
+
+load_dotenv()
+
+
+def configure_logging() -> None:
+    log_level = os.getenv("LOG_LEVEL", "INFO").upper()
+    logging.basicConfig(
+        level=getattr(logging, log_level, logging.INFO),
+        format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
+        datefmt="%Y-%m-%dT%H:%M:%S",
+        handlers=[logging.StreamHandler(sys.stdout)],
+    )
+
+
+def main() -> None:
+    configure_logging()
+    logger = logging.getLogger(__name__)
+    logger.info("Starting Meeting Guardian")
+
+    from .scheduler import MeetingGuardianScheduler
+
+    scheduler = MeetingGuardianScheduler()
+
+    if os.getenv("RUN_SUMMARY_ON_START", "false").lower() == "true":
+        scheduler.run_daily_summary()
+
+    scheduler.start()
+
+
+if __name__ == "__main__":
+    main()
+PYEOF
+
+cat > tests/test_calendar_service.py << 'PYEOF'
+from datetime import datetime, timezone
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+from src.calendar_service import CalendarService
+from src.models import EventCategory
+
+
+@pytest.fixture
+def mock_service():
+    with patch("src.calendar_service.build"), \
+         patch("src.calendar_service.Credentials"), \
+         patch("os.path.exists", return_value=False), \
+         patch("src.calendar_service.InstalledAppFlow") as mock_flow:
+        mock_flow.from_client_secrets_file.return_value.run_local_server \
+            .return_value = MagicMock()
+        service = CalendarService.__new__(CalendarService)
+        service._service = MagicMock()
+        service._credentials_path = "credentials.json"
+        service._token_path = "token.json"
+        yield service
+
+
+RAW_EVENT = {
+    "id": "abc123",
+    "summary": "Reunião de Projeto",
+    "start": {"dateTime": "2025-01-15T14:00:00-03:00"},
+    "end":   {"dateTime": "2025-01-15T15:00:00-03:00"},
+    "description": "Discussão do protótipo",
+    "location": "",
+    "attendees": [
+        {"email": "ana@example.com", "self": False},
+        {"email": "me@example.com",  "self": True},
+    ],
+    "conferenceData": {
+        "entryPoints": [
+            {"entryPointType": "video", "uri": "https://meet.google.com/abc-123"}
+        ]
+    },
+    "recurringEventId": "",
+}
+
+
+def test_parse_event_basic(mock_service):
+    event = mock_service._parse_event(RAW_EVENT)
+    assert event.title == "Reunião de Projeto"
+    assert event.duration_minutes == 60
+    assert "ana@example.com" in event.attendees
+    assert event.meet_link == "https://meet.google.com/abc-123"
+
+
+def test_classify_work_event(mock_service):
+    assert mock_service._classify_event("Daily Standup", "sprint review") == EventCategory.WORK
+
+
+def test_classify_study_event(mock_service):
+    assert mock_service._classify_event("Aula de Cálculo", "") == EventCategory.STUDY
+
+
+def test_classify_health_event(mock_service):
+    assert mock_service._classify_event("Consulta médico", "") == EventCategory.HEALTH
+
+
+def test_classify_other_event(mock_service):
+    assert mock_service._classify_event("Evento sem categoria", "") == EventCategory.OTHER
+PYEOF
+
+cat > tests/test_ai_summary_service.py << 'PYEOF'
+from datetime import datetime, timezone
+from unittest.mock import patch
+
+import pytest
+
+from src.models import CalendarEvent, EventCategory, WorkloadLevel
+from src.ai_summary_service import AISummaryService
+
+
+@pytest.fixture
+def service():
+    with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key", "USER_NAME": "Heitor"}):
+        with patch("src.ai_summary_service.Anthropic"):
+            return AISummaryService()
+
+
+def make_event(start_hour: int, end_hour: int, title: str = "Test") -> CalendarEvent:
+    tz = timezone.utc
+    return CalendarEvent(
+        id=f"evt_{start_hour}",
+        title=title,
+        start=datetime(2025, 1, 15, start_hour, 0, tzinfo=tz),
+        end=datetime(2025, 1, 15, end_hour, 0, tzinfo=tz),
+        category=EventCategory.WORK,
+    )
+
+
+def test_workload_light(service):
+    assert service._compute_workload(1.5, 1) == WorkloadLevel.LIGHT
+
+
+def test_workload_heavy(service):
+    assert service._compute_workload(7.0, 8) == WorkloadLevel.HEAVY
+
+
+def test_no_conflicts(service):
+    assert service._detect_conflicts([make_event(9, 10), make_event(11, 12)]) == []
+
+
+def test_detect_conflict(service):
+    assert len(service._detect_conflicts([make_event(9, 11), make_event(10, 12)])) == 1
+
+
+def test_free_blocks(service):
+    blocks = service._compute_free_blocks([make_event(9, 10), make_event(12, 13)])
+    assert len(blocks) == 1
+    assert blocks[0][0].hour == 10
+    assert blocks[0][1].hour == 12
+PYEOF
+
+cat > tests/test_email_service.py << 'PYEOF'
+import smtplib
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+from src.email_service import EmailService
+
+
+@pytest.fixture
+def service():
+    with patch.dict("os.environ", {
+        "SMTP_USER": "test@gmail.com",
+        "SMTP_PASSWORD": "senha-app",
+        "EMAIL_RECIPIENT": "destino@email.com",
+        "SMTP_HOST": "smtp.gmail.com",
+        "SMTP_PORT": "587",
+    }):
+        return EmailService()
+
+
+def test_send_email_success(service):
+    with patch("smtplib.SMTP") as mock_smtp:
+        mock_server = MagicMock()
+        mock_smtp.return_value.__enter__.return_value = mock_server
+        service.send(subject="Teste", plain_body="Corpo do e-mail", subtitle="Sub")
+        mock_server.starttls.assert_called_once()
+        mock_server.login.assert_called_once_with("test@gmail.com", "senha-app")
+        mock_server.sendmail.assert_called_once()
+
+
+def test_send_email_failure(service):
+    with patch("smtplib.SMTP") as mock_smtp:
+        mock_smtp.return_value.__enter__.side_effect = smtplib.SMTPException("Erro")
+        with pytest.raises(smtplib.SMTPException):
+            service.send(subject="Erro", plain_body="Falha")
+
+
+def test_missing_env_raises():
+    with patch.dict("os.environ", {}, clear=True):
+        with pytest.raises(ValueError):
+            EmailService()
+PYEOF
+
+cat > tests/test_slack_service.py << 'PYEOF'
+from unittest.mock import MagicMock, patch
+
+import pytest
+from slack_sdk.errors import SlackApiError
+
+from src.slack_service import SlackService
+
+
+@pytest.fixture
+def service():
+    with patch.dict("os.environ", {
+        "SLACK_BOT_TOKEN": "xoxb-test-token",
+        "SLACK_USER_ID": "U0123456789",
+    }):
+        with patch("src.slack_service.WebClient"):
+            svc = SlackService()
+            svc._client = MagicMock()
+            return svc
+
+
+def test_send_dm_success(service):
+    service._client.chat_postMessage.return_value = {"ts": "12345.67890"}
+    service.send_direct_message("Olá, Heitor!")
+    service._client.chat_postMessage.assert_called_once_with(
+        channel="U0123456789", text="Olá, Heitor!", mrkdwn=True
+    )
+
+
+def test_send_dm_failure(service):
+    service._client.chat_postMessage.side_effect = SlackApiError(
+        message="Error", response={"error": "not_authed"}
+    )
+    with pytest.raises(SlackApiError):
+        service.send_direct_message("Teste")
+
+
+def test_missing_user_id_raises():
+    with patch.dict("os.environ", {"SLACK_BOT_TOKEN": "xoxb-test", "SLACK_USER_ID": ""}):
+        with patch("src.slack_service.WebClient"):
+            with pytest.raises(ValueError):
+                SlackService()
+PYEOF
+
+cat > requirements.txt << 'EOF'
+anthropic>=0.25.0
+apscheduler>=3.10.4
+google-auth>=2.29.0
+google-auth-oauthlib>=1.2.0
+google-api-python-client>=2.127.0
+slack-sdk>=3.27.1
+python-dotenv>=1.0.1
+pytest>=8.2.0
+pytest-mock>=3.14.0
+EOF
+
+cat > .env.example << 'EOF'
+# Google Calendar
+GOOGLE_CREDENTIALS_PATH=credentials.json
+GOOGLE_TOKEN_PATH=token.json
+
+# Anthropic (Claude)
+ANTHROPIC_API_KEY=sk-ant-...
+CLAUDE_MODEL=claude-3-5-sonnet-20241022
+
+# Slack
+SLACK_BOT_TOKEN=xoxb-...
+SLACK_USER_ID=U0123456789
+
+# Email (Gmail SMTP)
+SMTP_HOST=smtp.gmail.com
+SMTP_PORT=587
+SMTP_USER=seu@gmail.com
+SMTP_PASSWORD=xxxx-xxxx-xxxx-xxxx
+EMAIL_RECIPIENT=destino@email.com
+
+# App
+USER_NAME=Heitor
+LOG_LEVEL=INFO
+RUN_SUMMARY_ON_START=false
+TZ=America/Sao_Paulo
+EOF
+
+cat > Dockerfile << 'EOF'
+FROM python:3.12-slim
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY . .
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    TZ=America/Sao_Paulo
+
+CMD ["python", "-m", "src.main"]
+EOF
+
+cat > docker-compose.yml << 'EOF'
+version: "3.9"
+
+services:
+  meeting-guardian:
+    build: .
+    container_name: meeting-guardian
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - ./credentials.json:/app/credentials.json:ro
+      - ./token.json:/app/token.json
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+EOF
+
+cat > .gitignore << 'EOF'
+.env
+credentials.json
+token.json
+token*.json
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+.pytest_cache/
+.coverage
+htmlcov/
+*.log
+EOF
+
+echo ""
+echo "✅ Projeto criado com sucesso!"
+echo ""
+echo "Próximos passos:"
+echo "  1. cp .env.example .env"
+echo "  2. nano .env  (preencha suas credenciais)"
+echo "  3. python -m venv venv && source venv/bin/activate"
+echo "  4. pip install -r requirements.txt"
+echo "  5. python -c \"from src.calendar_service import CalendarService; CalendarService()\""
+echo "  6. pytest tests/ -v"
+echo "  7. RUN_SUMMARY_ON_START=true python -m src.main"
